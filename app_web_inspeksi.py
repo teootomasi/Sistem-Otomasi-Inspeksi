@@ -3,65 +3,58 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import os
-import gdown
-import time
 
 # --- KONFIGURASI ---
 MODEL_PATH = "model_inspeksi_botol.keras"
-DRIVE_FILE_ID = '1SHwoXXkCyn5FN9c5ll0b-rqsc_NRSbGo'  # ID Baru Anda
+VIDEO_FILE = "video_uji.mp4"
 
-st.set_page_config(page_title="Sistem Inspeksi Visual", layout="wide")
+st.set_page_config(page_title="Sistem Inspeksi Botol", layout="wide")
 st.title("🏭 Sistem Inspeksi Visual Otomatis")
 
+# 1. Pastikan model ada (Harus sudah ada di GitHub)
+if not os.path.exists(MODEL_PATH):
+    st.error(f"File {MODEL_PATH} tidak ditemukan di folder! Silakan upload file model ke GitHub Anda.")
+    st.stop()
 
-# --- LOAD MODEL (Dengan Verifikasi) ---
-@st.cache_resource
-def load_my_model():
-    if not os.path.exists(MODEL_PATH):
-        st.info("Mengunduh model dari Google Drive...")
-        url = f'https://drive.google.com/uc?id={DRIVE_FILE_ID}'
-        gdown.download(url, MODEL_PATH, quiet=False)
-        time.sleep(2)  # Jeda untuk memastikan file tertulis
+model = tf.keras.models.load_model(MODEL_PATH)
 
-    return tf.keras.models.load_model(MODEL_PATH)
+# 2. Pilihan Input
+input_type = st.radio("Pilih Sumber Input:", ["Video Uji (Cloud/Lokal)", "Webcam (Hanya Lokal)"])
 
-
-# --- PROSES UTAMA ---
-try:
-    model = load_my_model()
-
-    # Inisialisasi Counter
-    if 'ok_count' not in st.session_state: st.session_state.ok_count = 0
-    if 'ng_count' not in st.session_state: st.session_state.ng_count = 0
-
-    col1, col2 = st.columns([2, 1])
-    frame_placeholder = col1.empty()
-
+# 3. Logika Kamera/Video
+if input_type == "Webcam (Hanya Lokal)":
     cap = cv2.VideoCapture(0)
+else:
+    cap = cv2.VideoCapture(VIDEO_FILE)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+frame_placeholder = st.empty()
+if 'ok_count' not in st.session_state: st.session_state.ok_count = 0
+if 'ng_count' not in st.session_state: st.session_state.ng_count = 0
 
-        # Preprocessing & Prediksi
-        img_res = cv2.resize(frame, (96, 96))
-        img_norm = img_res.reshape(1, 96, 96, 1) / 255.0
-        pred = model.predict(img_norm, verbose=0)
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Loop jika video habis
+        continue
 
-        # Logika Keputusan
-        hasil = "NORMAL" if pred[0][0] < 0.5 else "CACAT"
-        if hasil == "NORMAL":
-            st.session_state.ok_count += 1
-        else:
-            st.session_state.ng_count += 1
+    # Deteksi
+    img = cv2.resize(frame, (96, 96))
+    img_norm = img.reshape(1, 96, 96, 1) / 255.0
+    pred = model.predict(img_norm, verbose=0)
 
-        # Update HMI
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB")
-        col2.metric("Botol OK", st.session_state.ok_count)
-        col2.metric("Botol CACAT", st.session_state.ng_count)
+    label = "NORMAL" if pred[0][0] < 0.5 else "CACAT"
+    if label == "NORMAL":
+        st.session_state.ok_count += 1
+    else:
+        st.session_state.ng_count += 1
 
-        if cv2.waitKey(100) & 0xFF == ord('q'): break
-    cap.release()
-except Exception as e:
-    st.error(f"Terjadi error: {e}")
+    # Tampilan
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_placeholder.image(frame_rgb, channels="RGB")
+    st.write(f"### Status Terakhir: {label}")
+    st.metric("Botol OK", st.session_state.ok_count)
+    st.metric("Botol CACAT", st.session_state.ng_count)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release()
