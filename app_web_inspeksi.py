@@ -6,34 +6,31 @@ import os
 import gdown
 import time
 
+# --- KONFIGURASI ---
 MODEL_PATH = "model_inspeksi_botol.keras"
-DRIVE_FILE_ID = '15tS5XwWmiE0qDNq6ydParHAa_0sYO2AB'
+DRIVE_FILE_ID = '1SHwoXXkCyn5FN9c5ll0b-rqsc_NRSbGo'  # ID Baru Anda
 
-st.set_page_config(page_title="Sistem Inspeksi Botol", layout="wide")
+st.set_page_config(page_title="Sistem Inspeksi Visual", layout="wide")
 st.title("🏭 Sistem Inspeksi Visual Otomatis")
 
 
-# --- FUNGSI DOWNLOAD & VERIFIKASI ---
+# --- LOAD MODEL (Dengan Verifikasi) ---
 @st.cache_resource
-def prepare_model():
+def load_my_model():
     if not os.path.exists(MODEL_PATH):
-        st.warning("Model belum ditemukan, memulai unduhan dari Cloud...")
+        st.info("Mengunduh model dari Google Drive...")
         url = f'https://drive.google.com/uc?id={DRIVE_FILE_ID}'
         gdown.download(url, MODEL_PATH, quiet=False)
+        time.sleep(2)  # Jeda untuk memastikan file tertulis
 
-        # Tambahkan jeda/verifikasi
-        time.sleep(2)
-
-    if os.path.exists(MODEL_PATH):
-        return tf.keras.models.load_model(MODEL_PATH)
-    else:
-        return None
+    return tf.keras.models.load_model(MODEL_PATH)
 
 
 # --- PROSES UTAMA ---
-model = prepare_model()
+try:
+    model = load_my_model()
 
-if model is not None:
+    # Inisialisasi Counter
     if 'ok_count' not in st.session_state: st.session_state.ok_count = 0
     if 'ng_count' not in st.session_state: st.session_state.ng_count = 0
 
@@ -41,15 +38,17 @@ if model is not None:
     frame_placeholder = col1.empty()
 
     cap = cv2.VideoCapture(0)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
 
-        # Proses deteksi
+        # Preprocessing & Prediksi
         img_res = cv2.resize(frame, (96, 96))
         img_norm = img_res.reshape(1, 96, 96, 1) / 255.0
         pred = model.predict(img_norm, verbose=0)
 
+        # Logika Keputusan
         hasil = "NORMAL" if pred[0][0] < 0.5 else "CACAT"
         if hasil == "NORMAL":
             st.session_state.ok_count += 1
@@ -64,5 +63,5 @@ if model is not None:
 
         if cv2.waitKey(100) & 0xFF == ord('q'): break
     cap.release()
-else:
-    st.error("Gagal memuat model. Pastikan file di Google Drive dapat diakses publik.")
+except Exception as e:
+    st.error(f"Terjadi error: {e}")
