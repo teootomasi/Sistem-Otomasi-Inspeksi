@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import os
+import time
 
 st.set_page_config(page_title="Sistem Inspeksi", layout="wide")
 
@@ -20,29 +21,44 @@ start_btn = st.sidebar.button("▶ START")
 
 col1, col2 = st.columns([2, 1])
 frame_placeholder = col1.empty()
+status_placeholder = col2.empty()
 
 if start_btn:
-    # Cek apakah video ada di folder
-    if mode == "Video Uji" and not os.path.exists("video_uji.mp4"):
-        st.error("File 'video_uji.mp4' tidak ditemukan di folder GitHub!")
-    else:
-        cap = cv2.VideoCapture(0 if mode == "Live Webcam" else "video_uji.mp4")
+    cap = cv2.VideoCapture(0 if mode == "Live Webcam" else "video_uji.mp4")
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                st.info("Video Selesai atau Tidak Terbaca")
-                break
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
 
-            # Prediksi
-            img = cv2.resize(frame, (96, 96))
-            img_input = np.expand_dims(img.astype('float32') / 255.0, axis=0)
-            pred = float(model.predict(img_input, verbose=0)[0][0])
+        # --- PERBAIKAN DIMENSI (INPUT SHAPE) ---
+        # 1. Resize ke ukuran yang sama saat model dilatih (96x96)
+        img = cv2.resize(frame, (96, 96))
+
+        # 2. Pastikan input memiliki 3 Channel (RGB) - Tambahkan cv2.cvtColor jika perlu
+        # Jika model dilatih dengan RGB:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # 3. Normalisasi
+        img_input = img_rgb.astype('float32') / 255.0
+
+        # 4. Tambahkan dimensi batch (1, 96, 96, 3)
+        img_input = np.expand_dims(img_input, axis=0)
+
+        # --- PREDIKSI ---
+        try:
+            prediction = model.predict(img_input, verbose=0)
+            pred = float(prediction[0][0])
+
             status = "CACAT" if pred > 0.5 else "NORMAL"
 
-            # Tampilan
+            # --- TAMPILAN ---
             frame_placeholder.image(frame, channels="BGR", use_container_width=True)
-            col2.metric("Status Terakhir", status)
+            status_placeholder.metric("Status Terakhir", status)
 
             time.sleep(0.5)
-        cap.release()
+        except Exception as e:
+            st.error(f"Error Model: {e}")
+            st.write("Detail input:", img_input.shape)  # Untuk debugging
+            break
+
+    cap.release()
