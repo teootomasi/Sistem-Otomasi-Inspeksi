@@ -1,4 +1,5 @@
-streamlit
+streamlit>=1.25.0
 opencv-python-headless
 numpy
 tensorflow
+pandas
