@@ -4,71 +4,92 @@ import numpy as np
 import tensorflow as tf
 import pandas as pd
 import time
+import os
 
-st.set_page_config(page_title="Sistem Inspeksi Botol", layout="wide")
+# --- KONFIGURASI LAYOUT ---
+st.set_page_config(page_title="Smart Factory Inspection", layout="wide")
 
-# --- INISIALISASI STATE ---
-if 'history' not in st.session_state:
-    st.session_state.history = []
+# Styling agar kamera dan dashboard tidak saling "memakan" ruang
+st.markdown("""
+    <style>
+    [data-testid="stImage"] { width: 100% !important; border-radius: 10px; border: 2px solid #333; }
+    .css-1r6slp0 { padding: 0 !important; }
+    </style>
+""", unsafe_allow_html=True)
 
 
 # --- LOAD MODEL ---
 @st.cache_resource
-def load_my_model():
+def load_model():
     return tf.keras.models.load_model("model_inspeksi_botol.keras")
 
 
-model = load_my_model()
+model = load_model()
 
-# --- SIDEBAR KONTROL (PERMANEN) ---
-st.sidebar.title("Kontrol Sistem")
-mode = st.sidebar.radio("Pilih Input:", ["Video Uji", "Webcam"])
-start = st.sidebar.button("▶ START")
-stop = st.sidebar.button("⏹ STOP")
+
+# --- AUTO-SAVE LOGIKA ---
+def save_log(new_data):
+    file_path = "laporan_produksi.csv"
+    if os.path.exists(file_path):
+        df_existing = pd.read_csv(file_path)
+        pd.concat([df_existing, new_data]).to_csv(file_path, index=False)
+    else:
+        new_data.to_csv(file_path, index=False)
+
+
+# --- SIDEBAR ---
+st.sidebar.title("Industrial Control")
+mode = st.sidebar.radio("Source:", ["Video Uji", "Live Webcam"])
+start_btn = st.sidebar.button("▶ START INSPECTION")
+stop_btn = st.sidebar.button("⏹ STOP SYSTEM")
 
 # --- TAMPILAN UTAMA ---
-st.title("🏭 Sistem Inspeksi Visual Otomatis")
-col_view, col_report = st.columns([2, 1])
+st.title("🏭 Automated Bottle Inspection System")
+tab1, tab2 = st.tabs(["Live Vision", "Production Report"])
 
-frame_placeholder = col_view.empty()
-status_display = col_view.empty()
+with tab1:
+    col1, col2 = st.columns([1.5, 1])  # Proporsi layar agar kamera tetap lega
+    frame_placeholder = col1.empty()
+    status_placeholder = col2.empty()
 
-# --- LOGIKA OPERASIONAL ---
-if start:
-    cap = cv2.VideoCapture(0 if mode == "Webcam" else "video_uji.mp4")
+    if start_btn:
+        cap = cv2.VideoCapture(0 if mode == "Live Webcam" else "video_uji.mp4")
+        # Mengatur resolusi agar pas (640x480 adalah standar laptop)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    while cap.isOpened() and not stop:
-        ret, frame = cap.read()
-        if not ret: break
+        while cap.isOpened() and not stop_btn:
+            ret, frame = cap.read()
+            if not ret: break
 
-        # Preprocessing
-        img = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (96, 96))
-        img_norm = img.reshape(1, 96, 96, 1) / 255.0
+            # Preprocessing
+            img = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (96, 96))
+            img_norm = img.reshape(1, 96, 96, 1) / 255.0
 
-        # Prediksi
-        pred = model.predict(img_norm, verbose=0)
-        label = "NORMAL" if pred[0][0] < 0.5 else "CACAT"
-        conf = (1 - pred[0][0]) if label == "NORMAL" else pred[0][0]
+            # Prediksi
+            pred = model.predict(img_norm, verbose=0)
+            status = "NORMAL" if pred[0][0] < 0.5 else "CACAT"
 
-        # Update Visual Feed
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB")
-        status_display.success(f"### Status Terkini: {label} ({conf * 100:.1f}%)")
+            # Update UI
+            # Mengubah frame agar tidak terpotong (mengikuti ratio asli)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_placeholder.image(frame_rgb, use_column_width=True)
 
-        # Simpan ke riwayat (Logika sederhana: hanya simpan jika ada perubahan status)
-        if not st.session_state.history or st.session_state.history[-1]['Status'] != label:
-            st.session_state.history.append({"Waktu": time.strftime("%H:%M:%S"), "Status": label})
+            status_placeholder.markdown(f"""
+                ### Inspection Result
+                Status: **{status}**
+                Confidence: {100 - pred[0][0] * 100:.2f}%
+            """)
 
-        time.sleep(0.5)  # Kecepatan inspeksi
+            # Auto-save ke CSV
+            new_log = pd.DataFrame({"Waktu": [time.strftime("%H:%M:%S")], "Status": [status]})
+            save_log(new_log)
 
-    cap.release()
+            time.sleep(1.0)
+        cap.release()
 
-# --- AREA LAPORAN (SEPARATE SHEET) ---
-with col_report:
-    st.subheader("📋 Laporan Inspeksi")
-    if st.session_state.history:
-        df = pd.DataFrame(st.session_state.history)
-        st.table(df.tail(10))  # Menampilkan 10 botol terakhir
-        st.download_button("Download Laporan CSV", df.to_csv(), "laporan.csv", "text/csv")
-    else:
-        st.info("Tekan START untuk memulai inspeksi.")
+with tab2:
+    st.subheader("📋 Laporan Produksi Terintegrasi")
+    if os.path.exists("laporan_produksi.csv"):
+        df = pd.read_csv("laporan_produksi.csv")
+        st.dataframe(df.tail(20), use_container_width=True)
