@@ -6,42 +6,36 @@ import pandas as pd
 import time
 import os
 
+# Konfigurasi Layout
 st.set_page_config(page_title="Smart Factory Inspection", layout="wide")
 
 
+# Load Model - Pastikan file model ada di folder yang sama
 @st.cache_resource
 def load_model():
-    # Pastikan model Anda sudah benar-benar dilatih dengan dataset cacat yang cukup
     return tf.keras.models.load_model("model_inspeksi_botol.keras")
 
 
 model = load_model()
 
 
-# --- FUNGSI PREDIKSI YANG DIPERBAIKI ---
-def get_prediction(frame):
-    img = cv2.resize(frame, (96, 96))  # Sesuaikan dengan input size model Anda
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    img_norm = img_gray.reshape(1, 96, 96, 1) / 255.0
-
-    pred = model.predict(img_norm, verbose=0)[0][0]
-
-    # ADJUST THRESHOLD DI SINI
-    # Jika model Anda output-nya 0 = Normal, 1 = Cacat
-    # Jika masih salah, coba balik logika ini (pred > 0.5)
-    status = "CACAT" if pred > 0.5 else "NORMAL"
-    return status, pred
+# Fungsi Simpan Data
+def save_log(new_data):
+    file_path = "laporan_produksi.csv"
+    if os.path.exists(file_path):
+        df_existing = pd.read_csv(file_path)
+        pd.concat([df_existing, new_data], ignore_index=True).to_csv(file_path, index=False)
+    else:
+        new_data.to_csv(file_path, index=False)
 
 
-# --- SIDEBAR ---
+# Sidebar
 st.sidebar.title("Kontrol Sistem")
 mode = st.sidebar.radio("Input:", ["Video Uji", "Live Webcam"])
 start_btn = st.sidebar.button("▶ START")
 stop_btn = st.sidebar.button("⏹ STOP")
 
 st.title("🏭 Sistem Inspeksi Visual Otomatis")
-
-# Layout Utama
 col1, col2 = st.columns([2, 1])
 frame_placeholder = col1.empty()
 status_placeholder = col2.empty()
@@ -49,26 +43,39 @@ status_placeholder = col2.empty()
 if start_btn:
     cap = cv2.VideoCapture(0 if mode == "Live Webcam" else "video_uji.mp4")
 
-    # Gunakan counter untuk mengatur kecepatan inspeksi (1 detik per produk)
-    frame_count = 0
     while cap.isOpened() and not stop_btn:
         ret, frame = cap.read()
         if not ret: break
 
-        frame_count += 1
-        # Inspeksi hanya dilakukan setiap 30 frame (asumsi 30fps = 1 detik)
-        # Ubah angka 30 sesuai kecepatan video Anda
-        if frame_count % 30 == 0:
-            status, conf = get_prediction(frame)
-            status_placeholder.metric("Status Terakhir", status, f"Conf: {conf:.2f}")
+        # Preprocessing: Sesuaikan dengan input model Anda (Gray/RGB)
+        # Jika model dilatih dengan gambar berwarna, hapus cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        img = cv2.resize(frame, (96, 96))
+        img_norm = img.reshape(1, 96, 96, 3) / 255.0  # Gunakan 3 untuk RGB
 
-            # Log Data
-            new_log = pd.DataFrame({"Waktu": [time.strftime("%H:%M:%S")], "Status": [status]})
-            if os.path.exists("laporan_produksi.csv"):
-                pd.concat([pd.read_csv("laporan_produksi.csv"), new_log]).to_csv("laporan_produksi.csv", index=False)
-            else:
-                new_log.to_csv("laporan_produksi.csv", index=False)
+        pred = model.predict(img_norm, verbose=0)[0][0]
 
+        # LOGIKA PREDIKSI:
+        # Jika model output 0-1, sesuaikan thresholdnya.
+        # Jika masih salah, tukar posisi "NORMAL" dan "CACAT"
+        status = "CACAT" if pred > 0.5 else "NORMAL"
+        conf = (pred * 100) if status == "CACAT" else ((1 - pred) * 100)
+
+        # Update UI
         frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
-        # Hapus time.sleep agar video tidak patah-patah
+        status_placeholder.metric("Status Terakhir", status, f"{conf:.2f}%")
+
+        # Log ke CSV
+        new_log = pd.DataFrame({"Waktu": [time.strftime("%H:%M:%S")], "Status": [status], "Conf": [f"{conf:.2f}%"]})
+        save_log(new_log)
+
+        # Jeda 0.5 detik agar sistem responsif tapi tidak terlalu berat
+        time.sleep(0.5)
+
     cap.release()
+
+# Tab Laporan
+st.divider()
+if os.path.exists("laporan_produksi.csv"):
+    st.subheader("📋 Laporan Produksi")
+    df = pd.read_csv("laporan_produksi.csv")
+    st.dataframe(df.tail(10), use_container_width=True)
