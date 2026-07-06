@@ -2,8 +2,6 @@ import streamlit as st
 import cv2
 import numpy as np
 import tensorflow as tf
-import pandas as pd
-import time
 import os
 
 st.set_page_config(page_title="Sistem Inspeksi", layout="wide")
@@ -22,38 +20,29 @@ start_btn = st.sidebar.button("▶ START")
 
 col1, col2 = st.columns([2, 1])
 frame_placeholder = col1.empty()
-status_placeholder = col2.empty()
 
 if start_btn:
-    cap = cv2.VideoCapture(0 if mode == "Live Webcam" else "video_uji.mp4")
+    # Cek apakah video ada di folder
+    if mode == "Video Uji" and not os.path.exists("video_uji.mp4"):
+        st.error("File 'video_uji.mp4' tidak ditemukan di folder GitHub!")
+    else:
+        cap = cv2.VideoCapture(0 if mode == "Live Webcam" else "video_uji.mp4")
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret: break
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                st.info("Video Selesai atau Tidak Terbaca")
+                break
 
-        # --- PREPROCESSING AMAN ---
-        img = cv2.resize(frame, (96, 96))
-        # Mengubah ke format float32
-        img_input = img.astype('float32') / 255.0
-        # Memastikan dimensi (1, 96, 96, 3) untuk RGB
-        img_input = np.expand_dims(img_input, axis=0)
-
-        # --- PREDIKSI ---
-        try:
-            prediction = model.predict(img_input, verbose=0)
-            # Mengambil nilai tunggal
-            pred = float(prediction[0][0])
-
+            # Prediksi
+            img = cv2.resize(frame, (96, 96))
+            img_input = np.expand_dims(img.astype('float32') / 255.0, axis=0)
+            pred = float(model.predict(img_input, verbose=0)[0][0])
             status = "CACAT" if pred > 0.5 else "NORMAL"
-            conf = (pred * 100) if status == "CACAT" else ((1 - pred) * 100)
 
-            # --- TAMPILAN ---
+            # Tampilan
             frame_placeholder.image(frame, channels="BGR", use_container_width=True)
-            status_placeholder.metric("Status Terakhir", status, f"{conf:.1f}%")
+            col2.metric("Status Terakhir", status)
 
-        except Exception as e:
-            st.error(f"Error Model: {e}")
-            break
-
-        time.sleep(0.5)
-    cap.release()
+            time.sleep(0.5)
+        cap.release()
