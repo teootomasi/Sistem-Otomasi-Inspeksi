@@ -66,7 +66,7 @@ with tab1:
             conf = (1 - pred[0][0]) if status == "NORMAL" else pred[0][0]
 
             # Update UI & Save
-            frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_column_width=True)
+            frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
             status_placeholder.metric("Status Terakhir", status, f"{conf:.2%}")
 
             new_log = pd.DataFrame({"Waktu": [time.strftime("%H:%M:%S")], "Status": [status]})
@@ -79,6 +79,6 @@ with tab2:
     st.subheader("📋 Laporan Produksi")
     if os.path.exists("laporan_produksi.csv"):
         df = pd.read_csv("laporan_produksi.csv")
-        st.dataframe(df.tail(20), use_column_width=True)
+        st.dataframe(df.tail(20), use_container_width=True)
         with open("laporan_produksi.csv", "rb") as f:
             st.download_button("Download Laporan CSV", f, "laporan_produksi.csv")
