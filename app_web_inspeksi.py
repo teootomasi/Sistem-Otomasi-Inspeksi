@@ -3,67 +3,69 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import os
+import pandas as pd
+import time
 
-# --- KONFIGURASI HALAMAN ---
+# --- KONFIGURASI ---
 st.set_page_config(page_title="Sistem Inspeksi Botol", layout="wide")
 st.title("🏭 Sistem Inspeksi Visual Otomatis")
 
-# --- 1. LOAD MODEL CNN ---
+# --- INISIALISASI STATE (Dinamis & Terus Berjalan) ---
+if 'log_data' not in st.session_state:
+    st.session_state.log_data = pd.DataFrame(columns=["Waktu", "Status", "Keyakinan"])
+if 'counter' not in st.session_state:
+    st.session_state.counter = {"NORMAL": 0, "CACAT": 0}
+
+# --- LOAD MODEL ---
 MODEL_PATH = "model_inspeksi_botol.keras"
-if os.path.exists(MODEL_PATH):
-    model = tf.keras.models.load_model(MODEL_PATH)
-else:
-    st.error(f"File {MODEL_PATH} tidak ditemukan di folder proyek!")
-    st.stop()
+model = tf.keras.models.load_model(MODEL_PATH)
 
-# --- 2. SIDEBAR & KONTROL ---
+# --- SIDEBAR ---
 mode = st.sidebar.radio("Pilih Mode:", ["Video Uji (Cloud)", "Webcam (Lokal)"])
-stop_btn = st.sidebar.button("STOP APLIKASI")
+if st.sidebar.button("Reset Statistik"):
+    st.session_state.log_data = pd.DataFrame(columns=["Waktu", "Status", "Keyakinan"])
+    st.session_state.counter = {"NORMAL": 0, "CACAT": 0}
 
-if stop_btn:
-    st.warning("Aplikasi dihentikan. Silakan refresh halaman untuk mulai lagi.")
-    st.stop()
+# --- INPUT VIDEO ---
+cap = cv2.VideoCapture(0) if mode == "Webcam (Lokal)" else cv2.VideoCapture("video_uji.mp4")
 
-# --- 3. SETUP INPUT ---
-if mode == "Webcam (Lokal)":
-    cap = cv2.VideoCapture(0)
-else:
-    cap = cv2.VideoCapture("video_uji.mp4")
-
-# --- 4. LAYOUT ---
 col1, col2 = st.columns([2, 1])
 frame_placeholder = col1.empty()
-status_placeholder = col2.empty()
 
-# --- 5. LOOP UTAMA ---
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         continue
 
-    # A. PREPROCESSING
+    # PREDIKSI
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    img_resized = cv2.resize(gray, (96, 96))
-    img_norm = img_resized.reshape(1, 96, 96, 1) / 255.0
-
-    # B. PREDIKSI
+    img = cv2.resize(gray, (96, 96))
+    img_norm = img.reshape(1, 96, 96, 1) / 255.0
     pred = model.predict(img_norm, verbose=0)
+
     label = "NORMAL" if pred[0][0] < 0.5 else "CACAT"
-    confidence = (1 - pred[0][0]) if label == "NORMAL" else pred[0][0]
+    conf = (1 - pred[0][0]) if label == "NORMAL" else pred[0][0]
 
-    # C. UPDATE TAMPILAN
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame_placeholder.image(frame_rgb, channels="RGB")
+    # UPDATE COUNTER
+    st.session_state.counter[label] += 1
 
-    with status_placeholder.container():
-        st.subheader("Hasil Inspeksi")
-        if label == "NORMAL":
-            st.success(f"### Status: {label}")
-        else:
-            st.error(f"### Status: {label}")
-        st.metric("Tingkat Keyakinan", f"{confidence * 100:.2f}%")
+    # UPDATE LOG (Simpan 10 data terakhir saja)
+    new_log = pd.DataFrame(
+        {"Waktu": [time.strftime("%H:%M:%S")], "Status": [label], "Keyakinan": [f"{conf * 100:.2f}%"]})
+    st.session_state.log_data = pd.concat([new_log, st.session_state.log_data]).head(10)
 
-    # Tidak ada cv2.waitKey() di sini agar tidak crash di Cloud
+    # VISUALISASI
+    frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
 
-cap.release()
+    with col2.container():
+        st.subheader("📊 Monitoring Real-time")
+        k1, k2 = st.columns(2)
+        k1.metric("Total Normal", st.session_state.counter["NORMAL"])
+        k2.metric("Total Cacat", st.session_state.counter["CACAT"])
+
+        st.write("---")
+        st.write("**Log Riwayat Inspeksi:**")
+        st.dataframe(st.session_state.log_data, use_container_width=True)
+
+    time.sleep(0.1)  # Memberi jeda agar tidak terlalu cepat
