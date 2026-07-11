@@ -1,10 +1,24 @@
+import os
+# PENTING: baris-baris os.environ berikut HARUS berada paling atas, sebelum
+# import cv2/torch/ultralytics manapun. Di server cloud dengan CPU/RAM
+# terbatas (mis. Streamlit Community Cloud free tier), PyTorch secara default
+# mencoba membuka banyak thread paralel (OpenMP/MKL) sesuai jumlah core yang
+# terdeteksi di HOST, bukan yang benar-benar dijatahkan ke container. Ini
+# sering menyebabkan crash (Segmentation fault) tepat saat proses import,
+# sebelum kode aplikasi sempat berjalan sama sekali. Membatasi jumlah thread
+# di sini mencegah masalah tersebut.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_THREAD_LIMIT"] = "1"
+
 import streamlit as st
 import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import pandas as pd
 import time
-import os
 import io
 import threading
 import xlsxwriter
