@@ -1,13 +1,86 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import pandas as pd
 import time
 import os
 import io
+import threading
 import xlsxwriter
 from datetime import datetime
 from ultralytics import YOLO
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
+
+# Konfigurasi server STUN publik agar koneksi WebRTC (kamera browser pengunjung)
+# bisa terbentuk dari jaringan mana pun, bukan cuma di jaringan lokal yang sama.
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+})
+
+
+def pilih_kamera_ui():
+    """
+    Menampilkan dropdown berisi SEMUA kamera yang terdeteksi browser di
+    perangkat pengguna (kamera bawaan laptop maupun kamera eksternal USB,
+    misal webcam Logitech). Saat kamera dipilih, halaman akan reload dengan
+    parameter '?kamera_id=...' sehingga Python bisa membaca kamera mana yang
+    dipilih dan meneruskannya sebagai constraint ke streamlit-webrtc.
+    """
+    components.html(
+        """
+        <div style="font-family: sans-serif;">
+          <select id="kamera-select"
+                  style="width:100%; padding:8px; border-radius:6px; font-size:14px;
+                         background:#0E1117; color:white; border:1px solid #444;">
+            <option value="">-- Memuat daftar kamera... --</option>
+          </select>
+        </div>
+        <script>
+        async function muatDaftarKamera() {
+            const select = document.getElementById('kamera-select');
+            try {
+                // Catatan: sengaja TIDAK memanggil getUserMedia() di sini, supaya
+                // dropdown ini tidak ikut mengunci kamera dan berebut akses dengan
+                // video utama (webrtc_streamer) yang berjalan terpisah. Nama kamera
+                // (label) baru akan muncul setelah akses kamera pernah diizinkan
+                // minimal sekali lewat tombol START pada video utama; sebelum itu,
+                // dropdown tetap bisa dipakai memilih device, hanya namanya generik.
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const kameras = devices.filter(d => d.kind === 'videoinput');
+
+                const params = new URLSearchParams(window.parent.location.search);
+                const idTerpilih = params.get('kamera_id') || '';
+
+                select.innerHTML = '<option value="">-- Kamera default --</option>';
+                kameras.forEach((d, i) => {
+                    const opt = document.createElement('option');
+                    opt.value = d.deviceId;
+                    opt.text = d.label || ('Kamera ' + (i + 1) + ' (klik START agar nama muncul)');
+                    if (d.deviceId === idTerpilih) opt.selected = true;
+                    select.appendChild(opt);
+                });
+
+                if (kameras.length === 0) {
+                    select.innerHTML = '<option value="">Tidak ada kamera terdeteksi</option>';
+                }
+
+                select.onchange = function() {
+                    const p = new URLSearchParams(window.parent.location.search);
+                    if (select.value) { p.set('kamera_id', select.value); }
+                    else { p.delete('kamera_id'); }
+                    window.parent.location.search = p.toString();
+                };
+            } catch (e) {
+                select.innerHTML = '<option>Gagal memuat daftar kamera. Refresh halaman ini.</option>';
+            }
+        }
+        muatDaftarKamera();
+        </script>
+        """,
+        height=55,
+    )
 
 # ==============================================================================
 # 1. KONFIGURASI HALAMAN & STATE MANAGEMENT
@@ -237,6 +310,92 @@ with st.sidebar:
         bersihkan_file_sampah()
 
 # ==============================================================================
+# 2B. VIDEO PROCESSOR UNTUK LIVE WEBCAM BERBASIS BROWSER (streamlit-webrtc)
+# ==============================================================================
+# Kelas ini dijalankan oleh browser pengunjung: setiap frame yang ditangkap
+# webcam MEREKA (bukan kamera server) dikirim lewat WebRTC ke sini untuk
+# diproses model YOLO, lalu frame yang sudah digambari kotak deteksi
+# dikirim balik untuk ditampilkan live di browser pengunjung tersebut.
+# Karena recv() berjalan di thread terpisah, hasil deteksi disimpan di
+# 'self.hasil_terkini' dengan proteksi Lock agar aman dibaca oleh thread
+# utama Streamlit (untuk update KPI, log riwayat, dsb).
+class YOLOVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.hasil_terkini = {
+            "ada_objek": False, "is_cacat": False,
+            "max_conf": 0.0, "jumlah_botol": 0,
+            "waktu_update": 0.0,
+        }
+        self.latest_frame = None   # buffer frame mentah terbaru, dipakai fitur snapshot
+        self.ambang_batas = 0.25
+        self.fokus_roi = False
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        h, w, _ = img.shape
+
+        with self.lock:
+            self.latest_frame = img.copy()
+
+        ymin_v, ymax_v = int(h * 0.20), int(h * 0.95)
+        xmin_v, xmax_v = int(w * 0.20), int(w * 0.80)
+        area_uji = img[ymin_v:ymax_v, xmin_v:xmax_v] if self.fokus_roi else img
+
+        is_cacat, max_conf, jumlah_botol = False, 0.0, 0
+        canvas = img.copy()
+
+        if self.fokus_roi:
+            cv2.rectangle(canvas, (xmin_v, ymin_v), (xmax_v, ymax_v), (255, 255, 0), 2)
+
+        if model_tersedia:
+            hasil = model(area_uji, conf=self.ambang_batas, verbose=False)[0]
+            for box in hasil.boxes:
+                conf_val = float(box.conf[0])
+                x1, y1, x2, y2 = box.xyxy[0]
+                x1_f, y1_f, x2_f, y2_f = float(x1), float(y1), float(x2), float(y2)
+
+                if self.fokus_roi:
+                    x1_f += xmin_v; x2_f += xmin_v
+                    y1_f += ymin_v; y2_f += ymin_v
+
+                lebar_box, tinggi_box = x2_f - x1_f, y2_f - y1_f
+                luas_kotak = lebar_box * tinggi_box
+                if tinggi_box < (h * 0.25) or luas_kotak < 5000:
+                    continue
+
+                max_conf = max(max_conf, conf_val)
+                jumlah_botol += 1
+
+                if tinggi_box > 0 and (lebar_box / tinggi_box) > 0.55:
+                    is_cacat = True
+                    warna, label_box = (255, 0, 0), f"Cacat {conf_val:.2f}"
+                else:
+                    warna, label_box = (0, 255, 0), f"Normal {conf_val:.2f}"
+
+                cv2.rectangle(canvas, (int(x1_f), int(y1_f)), (int(x2_f), int(y2_f)), warna, 3)
+                cv2.putText(canvas, label_box, (int(x1_f), int(y1_f) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, warna, 2)
+        else:
+            max_conf, is_cacat, jumlah_botol = float(np.random.uniform(0.7, 0.95)), False, 1
+
+        status_txt = "CACAT" if is_cacat else "NORMAL"
+        warna_txt = (255, 0, 0) if is_cacat else (0, 255, 0)
+        cv2.putText(canvas, f"STATUS: {status_txt} ({jumlah_botol} Botol)", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, warna_txt, 3)
+
+        with self.lock:
+            self.hasil_terkini = {
+                "ada_objek": jumlah_botol > 0,
+                "is_cacat": is_cacat,
+                "max_conf": max_conf,
+                "jumlah_botol": jumlah_botol,
+                "waktu_update": time.time(),
+            }
+
+        return av.VideoFrame.from_ndarray(canvas, format="bgr24")
+
+# ==============================================================================
 # 3. LAYOUT HALAMAN UTAMA
 # ==============================================================================
 st.title("🏭 Sistem Inspeksi Visual Otomatis")
@@ -297,6 +456,89 @@ def perbarui_tampilan_laporan():
 
 perbarui_tampilan_laporan()
 
+
+def analisis_gambar_tunggal(img_bgr, label_sumber, ambang_batas, fokus_roi):
+    """
+    Menjalankan satu kali analisis deteksi cacat pada sebuah gambar (BGR),
+    lalu mencatat hasilnya ke KPI & riwayat data. Dipakai bersama oleh mode
+    'Unggah Gambar' maupun tombol 'Ambil Foto & Analisis' pada Live Webcam,
+    supaya logikanya konsisten di kedua tempat.
+    Return: (img_rgb_hasil_anotasi, is_cacat, max_conf, jumlah_botol)
+    """
+    h, w, _ = img_bgr.shape
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    ymin, ymax = int(h * 0.15), int(h * 0.85)
+    xmin, xmax = int(w * 0.20), int(w * 0.80)
+    area_uji = img_bgr[ymin:ymax, xmin:xmax] if fokus_roi else img_bgr
+
+    is_cacat_gambar, max_conf, jumlah_botol = False, 0.0, 0
+
+    if model_tersedia:
+        hasil = model(area_uji, conf=ambang_batas, verbose=False)[0]
+        jumlah_botol = len(hasil.boxes)
+        canvas_render = img_rgb.copy()
+
+        if fokus_roi:
+            cv2.rectangle(canvas_render, (xmin, ymin), (xmax, ymax), (0, 255, 255), 2)
+
+        for box in hasil.boxes:
+            conf_val = float(box.conf[0])
+            max_conf = max(max_conf, conf_val)
+
+            x1, y1, x2, y2 = box.xyxy[0]
+            x1_f, y1_f, x2_f, y2_f = float(x1), float(y1), float(x2), float(y2)
+            if fokus_roi:
+                x1_f += xmin; x2_f += xmin
+                y1_f += ymin; y2_f += ymin
+
+            lebar_box, tinggi_box = x2_f - x1_f, y2_f - y1_f
+            if tinggi_box > 0:
+                aspek_rasio = lebar_box / tinggi_box
+                if aspek_rasio > 0.38:
+                    is_cacat_gambar = True
+                    warna_box, label_box = (255, 0, 0), f"Cacat {conf_val:.2f}"
+                else:
+                    warna_box, label_box = (0, 255, 0), f"Normal {conf_val:.2f}"
+
+            cv2.rectangle(canvas_render, (int(x1_f), int(y1_f)), (int(x2_f), int(y2_f)), warna_box, 3)
+            cv2.putText(canvas_render, label_box, (int(x1_f), int(y1_f) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, warna_box, 2)
+
+        img_rgb = canvas_render
+    else:
+        max_conf, is_cacat_gambar, jumlah_botol = float(np.random.uniform(0.75, 0.96)), False, 1
+
+    label_kondisi_input = f"{label_sumber} (Tunggal)" if jumlah_botol <= 1 else f"{label_sumber} (Multi-Objek: {jumlah_botol} Botol)"
+
+    st.session_state.total_diperiksa += 1
+    if is_cacat_gambar:
+        st.session_state.total_cacat += 1
+        status_text, color_hex = "🚨 CACAT", "#FF4B4B"
+        cv2.putText(img_rgb, f"STATUS: CACAT ({jumlah_botol} Botol)", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 4)
+    else:
+        st.session_state.total_normal += 1
+        status_text, color_hex = "✅ NORMAL", "#24A148"
+        cv2.putText(img_rgb, f"STATUS: NORMAL ({jumlah_botol} Botol)", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 4)
+
+    st.session_state.riwayat_data.append({
+        "Waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Jenis Input": label_kondisi_input,
+        "Confidence Score": f"{max_conf*100:.1f}%",
+        "Hasil Evaluasi": "Cacat" if is_cacat_gambar else "Normal"
+    })
+    st.session_state.tren_akurasi.append(max_conf if max_conf > 0 else 0.50)
+    st.session_state.tren_loss.append(max(0.02, 1.0 - max_conf))
+
+    st.session_state.gambar_terrender = img_rgb
+    st.session_state.status_terakhir_html = (
+        f"<div style='background-color:{color_hex}; padding:10px; border-radius:10px; "
+        f"text-align:center; font-weight:bold; font-size:16px; color:white;'>{status_text}</div>"
+    )
+    st.session_state.max_conf_terakhir = max_conf
+
+    return img_rgb, is_cacat_gambar, max_conf, jumlah_botol
+
 # ==============================================================================
 # 4. ENGINE PEMROSESAN UTAMA (GAMBAR & VIDEO KONTROL)
 # ==============================================================================
@@ -306,92 +548,8 @@ if st.session_state.sistem_aktif:
         if gambar_file is not None:
             file_bytes = np.asarray(bytearray(gambar_file.read()), dtype=np.uint8)
             img = cv2.imdecode(file_bytes, 1)
-            h, w, _ = img.shape
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            
-            ymin, ymax = int(h * 0.15), int(h * 0.85)
-            xmin, xmax = int(w * 0.20), int(w * 0.80)
-            
-            if fokus_roi:
-                area_uji = img[ymin:ymax, xmin:xmax]
-            else:
-                area_uji = img
 
-            is_cacat_gambar = False
-            max_conf = 0.0
-            jumlah_botol = 0
-
-            if model_tersedia:
-                hasil = model(area_uji, conf=ambang_batas, verbose=False)[0]
-                jumlah_botol = len(hasil.boxes)
-                canvas_render = img_rgb.copy()
-                
-                if fokus_roi:
-                    cv2.rectangle(canvas_render, (xmin, ymin), (xmax, ymax), (0, 255, 255), 2)
-                
-                for box in hasil.boxes:
-                    conf_val = float(box.conf[0])
-                    if conf_val > max_conf:
-                        max_conf = conf_val
-                    
-                    x1, y1, x2, y2 = box.xyxy[0]
-                    x1_f, y1_f, x2_f, y2_f = float(x1), float(y1), float(x2), float(y2)
-                    
-                    if fokus_roi:
-                        x1_f += xmin
-                        x2_f += xmin
-                        y1_f += ymin
-                        y2_f += ymin
-                    
-                    lebar_box = x2_f - x1_f
-                    tinggi_box = y2_f - y1_f
-                    
-                    if tinggi_box > 0:
-                        aspek_rasio = lebar_box / tinggi_box
-                        if aspek_rasio > 0.38: 
-                            is_cacat_gambar = True
-                            warna_box = (255, 0, 0)
-                            label_box = f"Cacat {conf_val:.2f}"
-                        else:
-                            warna_box = (0, 255, 0)
-                            label_box = f"Normal {conf_val:.2f}"
-                    
-                    cv2.rectangle(canvas_render, (int(x1_f), int(y1_f)), (int(x2_f), int(y2_f)), warna_box, 3)
-                    cv2.putText(canvas_render, label_box, (int(x1_f), int(y1_f) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, warna_box, 2)
-                
-                img_rgb = canvas_render
-            else:
-                max_conf = float(np.random.uniform(0.75, 0.96))
-                is_cacat_gambar = False
-                jumlah_botol = 1
-
-            label_kondisi_input = "Gambar Tunggal" if jumlah_botol <= 1 else f"Gambar (Multi-Objek: {jumlah_botol} Botol)"
-
-            st.session_state.total_diperiksa += 1
-            if is_cacat_gambar:
-                st.session_state.total_cacat += 1
-                status_text = "🚨 CACAT"
-                color_hex = "#FF4B4B"
-                cv2.putText(img_rgb, f"STATUS: CACAT ({jumlah_botol} Botol)", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 4)
-            else:
-                st.session_state.total_normal += 1
-                status_text = "✅ NORMAL"
-                color_hex = "#24A148"
-                cv2.putText(img_rgb, f"STATUS: NORMAL ({jumlah_botol} Botol)", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 4)
-            
-            st.session_state.riwayat_data.append({
-                "Waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Jenis Input": label_kondisi_input,
-                "Confidence Score": f"{max_conf*100:.1f}%",
-                "Hasil Evaluasi": "Cacat" if is_cacat_gambar else "Normal"
-            })
-
-            st.session_state.tren_akurasi.append(max_conf if max_conf > 0 else 0.50)
-            st.session_state.tren_loss.append(max(0.02, 1.0 - max_conf))
-
-            st.session_state.gambar_terrender = img_rgb
-            st.session_state.status_terakhir_html = f"<div style='background-color:{color_hex}; padding:10px; border-radius:10px; text-align:center; font-weight:bold; font-size:16px; color:white;'>{status_text}</div>"
-            st.session_state.max_conf_terakhir = max_conf
+            analisis_gambar_tunggal(img, "Gambar", ambang_batas, fokus_roi)
 
             hitung_dan_tampilkan_kpi(p_tot, p_norm, p_cact, p_pct)
             perbarui_tampilan_laporan()
@@ -401,6 +559,111 @@ if st.session_state.sistem_aktif:
         else:
             frame_placeholder.warning("Silakan unggah berkas gambar terlebih dahulu pada panel kiri.")
             st.session_state.sistem_aktif = False
+
+    elif sumber_input == "Live Webcam":
+        st.info("📷 Klik tombol **START** pada kotak video di bawah untuk mengizinkan akses "
+                "kamera Anda. Video diproses langsung dari kamera perangkat yang membuka "
+                "halaman ini (browser Anda), bukan kamera server.")
+
+        st.markdown("**Pilih Kamera** (built-in laptop atau kamera eksternal seperti USB webcam):")
+        pilih_kamera_ui()
+        kamera_id_terpilih = st.query_params.get("kamera_id", "")
+
+        constraint_video = {"deviceId": {"exact": kamera_id_terpilih}} if kamera_id_terpilih else True
+
+        ctx = webrtc_streamer(
+            key=f"inspeksi-live-{kamera_id_terpilih or 'default'}",
+            video_processor_factory=YOLOVideoProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": constraint_video, "audio": False},
+            async_processing=True,
+        )
+
+        if ctx.video_processor:
+            ctx.video_processor.ambang_batas = ambang_batas
+            ctx.video_processor.fokus_roi = fokus_roi
+
+        st.markdown("---")
+        kol_snap1, kol_snap2 = st.columns([1, 2])
+        with kol_snap1:
+            tombol_snapshot = st.button("📸 Ambil Foto & Analisis Sekarang", use_container_width=True, type="primary")
+        snapshot_placeholder = st.empty()
+
+        if tombol_snapshot:
+            if ctx.video_processor is not None:
+                with ctx.video_processor.lock:
+                    frame_snapshot = (ctx.video_processor.latest_frame.copy()
+                                       if ctx.video_processor.latest_frame is not None else None)
+                if frame_snapshot is not None:
+                    img_hasil, is_cacat_snap, conf_snap, jml_snap = analisis_gambar_tunggal(
+                        frame_snapshot, "Live Webcam (Snapshot)", ambang_batas, fokus_roi
+                    )
+                    label_snap = "🚨 CACAT" if is_cacat_snap else "✅ NORMAL"
+                    snapshot_placeholder.image(
+                        skala_gambar_agar_pas(img_hasil), use_container_width=False,
+                        caption=f"Hasil Snapshot: {label_snap} — Keyakinan {conf_snap*100:.1f}% — {jml_snap} objek terdeteksi"
+                    )
+                    hitung_dan_tampilkan_kpi(p_tot, p_norm, p_cact, p_pct)
+                    perbarui_tampilan_laporan()
+                else:
+                    st.warning("Belum ada frame dari kamera. Pastikan video sudah tampil (klik START dulu), lalu coba lagi.")
+            else:
+                st.warning("Kamera belum aktif. Klik tombol **START** pada kotak video terlebih dahulu.")
+
+        st.markdown("---")
+        st.caption("Status di bawah ini adalah mode deteksi otomatis berkelanjutan (live), "
+                    "terpisah dari hasil snapshot di atas.")
+
+        while ctx.state.playing and st.session_state.sistem_aktif:
+            if ctx.video_processor:
+                with ctx.video_processor.lock:
+                    hasil = dict(ctx.video_processor.hasil_terkini)
+
+                objek_masih_baru = hasil["ada_objek"] and (time.time() - hasil["waktu_update"] < 2.0)
+
+                if objek_masih_baru:
+                    waktu_sekarang = time.time()
+                    if (waktu_sekarang - st.session_state.waktu_deteksi_terakhir) > 2.0:
+                        st.session_state.total_diperiksa += 1
+                        if hasil["is_cacat"]:
+                            st.session_state.total_cacat += 1
+                            status_eval = "Cacat"
+                        else:
+                            st.session_state.total_normal += 1
+                            status_eval = "Normal"
+
+                        label_kondisi_input = ("Live Webcam (Tunggal)" if hasil["jumlah_botol"] <= 1
+                                                else f"Live Webcam (Multi-Objek: {hasil['jumlah_botol']} Botol)")
+                        st.session_state.riwayat_data.append({
+                            "Waktu": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Jenis Input": label_kondisi_input,
+                            "Confidence Score": f"{hasil['max_conf']*100:.1f}%",
+                            "Hasil Evaluasi": status_eval
+                        })
+                        st.session_state.tren_akurasi.append(hasil["max_conf"] if hasil["max_conf"] > 0 else 0.50)
+                        st.session_state.tren_loss.append(max(0.02, 1.0 - hasil["max_conf"]))
+                        st.session_state.waktu_deteksi_terakhir = waktu_sekarang
+
+                    if hasil["is_cacat"]:
+                        status_text, color_hex = "🚨 CACAT", "#FF4B4B"
+                    else:
+                        status_text, color_hex = "✅ NORMAL", "#24A148"
+                    status_placeholder.markdown(
+                        f"<div style='background-color:{color_hex}; padding:10px; border-radius:10px; "
+                        f"text-align:center; font-weight:bold; font-size:16px; color:white;'>{status_text}</div>",
+                        unsafe_allow_html=True)
+                    prob_placeholder.markdown(f"**Tingkat Keyakinan:** {hasil['max_conf']*100:.1f}%")
+                    prob_placeholder.progress(hasil["max_conf"] if hasil["max_conf"] > 0 else 0.0)
+                else:
+                    status_placeholder.markdown(
+                        "<div style='background-color:#262730; padding:10px; border-radius:10px; "
+                        "text-align:center; font-weight:bold; font-size:16px; color:#A3A8B4;'>🔍 MENCARI OBJEK...</div>",
+                        unsafe_allow_html=True)
+
+                hitung_dan_tampilkan_kpi(p_tot, p_norm, p_cact, p_pct)
+                perbarui_tampilan_laporan()
+
+            time.sleep(0.5)
 
     else:
         cap = None
@@ -416,9 +679,6 @@ if st.session_state.sistem_aktif:
             with open(TEMP_VIDEO_PATH, "wb") as f:
                 f.write(video_file.read())
             cap = cv2.VideoCapture(TEMP_VIDEO_PATH)
-        elif sumber_input == "Live Webcam":
-            base_label = "Live Webcam"
-            cap = cv2.VideoCapture(0)
 
         if cap is not None and cap.isOpened():
             fps_target = 30
